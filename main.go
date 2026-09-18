@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -55,6 +56,18 @@ func connect(creds Creds, host string) (*VisionWebApi, error) {
 	)
 }
 
+// isAuthError returns true if the error looks like a 401/auth failure,
+// which is expected when a session has already been invalidated
+// (e.g., after switching authentication_mode to TACACS).
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "401") ||
+		strings.Contains(strings.ToLower(msg), "unauthorized")
+}
+
 // buildTacacsConfig builds a per-device tacacs_servers payload, injecting
 // the device's secret and the aaa_username from creds into the server entry.
 func buildTacacsConfig(base map[string]interface{}, secret, aaaUsername string) map[string]interface{} {
@@ -97,7 +110,9 @@ func testAAAConnectivity(nto *VisionWebApi) (interface{}, error) {
 }
 
 // configureDevice connects to a single device, applies TACACS+ config,
-// tests AAA connectivity, and returns a DeviceResult for reporting.
+// re-authenticates to verify (since applying TACACS+ / changing
+// authentication_mode may invalidate the original session), tests AAA
+// connectivity, and returns a DeviceResult for reporting.
 func configureDevice(cfg *Config, device Device) DeviceResult {
 	result := DeviceResult{
 		DeviceName: device.DeviceName,
@@ -105,17 +120,13 @@ func configureDevice(cfg *Config, device Device) DeviceResult {
 		Status:     "fail",
 	}
 
+	// ── Initial connection ────────────────────────────────────────────
 	nto, err := connect(cfg.Creds, device.IPAddress)
 	if err != nil {
 		result.Error = err.Error()
 		fmt.Fprintf(os.Stderr, "[%s] Error connecting: %v\n", device.DeviceName, err)
 		return result
 	}
-	defer func() {
-		if logoutErr := nto.Logout(); logoutErr != nil {
-			fmt.Fprintf(os.Stderr, "[%s] Warning: logout failed: %v\n", device.DeviceName, logoutErr)
-		}
-	}()
 
 	tacacsConfig := buildTacacsConfig(cfg.TacacsConfig, device.Secret, cfg.Creds.AAAUsername)
 
@@ -124,16 +135,30 @@ func configureDevice(cfg *Config, device Device) DeviceResult {
 		"authentication_mode": "TACACS",
 	}
 
+	// ── Apply TACACS config — this may invalidate the current session ──
 	fmt.Printf("[%s] Applying TACACS+ configuration to %s...\n", device.DeviceName, device.IPAddress)
 	modifyResult, err := nto.ModifySystem(systemArgs)
 	if err != nil {
 		result.Error = err.Error()
 		fmt.Fprintf(os.Stderr, "[%s] Error applying TACACS+ config: %v\n", device.DeviceName, err)
+		// Best-effort logout even on failure, ignoring expected 401s.
+		if logoutErr := nto.Logout(); logoutErr != nil && !isAuthError(logoutErr) {
+			fmt.Fprintf(os.Stderr, "[%s] Warning: logout failed: %v\n", device.DeviceName, logoutErr)
+		}
 		return result
 	}
 	fmt.Printf("[%s] modifySystem result: %v\n", device.DeviceName, modifyResult)
 
-	// Re-authenticate to verify config (mirrors Python's re-connect)
+	// ── Session may now be dead due to authentication_mode change.
+	//    Best-effort logout; a 401 here is expected and not a real error. ──
+	if logoutErr := nto.Logout(); logoutErr != nil {
+		if !isAuthError(logoutErr) {
+			fmt.Fprintf(os.Stderr, "[%s] Warning: logout failed: %v\n", device.DeviceName, logoutErr)
+		}
+		// else: expected — session was invalidated by the auth mode change, not a real problem.
+	}
+
+	// ── Reconnect fresh to verify the applied configuration ────────────
 	nto2, err := connect(cfg.Creds, device.IPAddress)
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to reconnect for verification: %v", err)
@@ -141,7 +166,7 @@ func configureDevice(cfg *Config, device Device) DeviceResult {
 		return result
 	}
 	defer func() {
-		if logoutErr := nto2.Logout(); logoutErr != nil {
+		if logoutErr := nto2.Logout(); logoutErr != nil && !isAuthError(logoutErr) {
 			fmt.Fprintf(os.Stderr, "[%s] Warning: logout failed (verify conn): %v\n", device.DeviceName, logoutErr)
 		}
 	}()
